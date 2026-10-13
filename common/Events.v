@@ -36,8 +36,8 @@ Set Warnings "-unsupported-attributes".
   are not preserved literally during compilation.  For concreteness,
   we use the following type for events.  Each event represents either:
 
-- A system call (e.g. an input/output operation), recording the
-  name of the system call, its parameters, and its result.
+- A system call (e.g. an input/output operation), recording the name of the
+  system call, its parameters, its result and its answer (bytes put in memory).
 
 - A volatile load from a global memory location, recording the chunk
   and address being read and the value just read.
@@ -62,7 +62,7 @@ Inductive eventval: Type :=
   | EVptr_global: ident -> ptrofs -> eventval.
 
 Inductive event: Type :=
-  | Event_syscall: string -> list eventval -> eventval -> event
+  | Event_syscall: string -> list eventval -> eventval -> list byte -> event
   | Event_vload: memory_chunk -> ident -> ptrofs -> eventval -> event
   | Event_vstore: memory_chunk -> ident -> ptrofs -> eventval -> event
   | Event_annot: string -> list eventval -> event.
@@ -500,14 +500,14 @@ Variable ge: Senv.t.
 (** Matching between traces corresponding to single transitions.
   Arguments (provided by the program) must be equal.
   Results (provided by the outside world) can vary as long as they
-  can be converted safely to values. *)
+  can be converted safely to values.  Answers can vary without constraint. *)
 
 Inductive match_traces: trace -> trace -> Prop :=
   | match_traces_E0:
       match_traces nil nil
-  | match_traces_syscall: forall id args res1 res2,
+  | match_traces_syscall: forall id args res1 res2 ans1 ans2,
       eventval_valid ge res1 -> eventval_valid ge res2 -> eventval_type res1 = eventval_type res2 ->
-      match_traces (Event_syscall id args res1 :: nil) (Event_syscall id args res2 :: nil)
+      match_traces (Event_syscall id args res1 ans1 :: nil) (Event_syscall id args res2 ans2 :: nil)
   | match_traces_vload: forall chunk id ofs res1 res2,
       eventval_valid ge res1 -> eventval_valid ge res2 -> eventval_type res1 = eventval_type res2 ->
       match_traces (Event_vload chunk id ofs res1 :: nil) (Event_vload chunk id ofs res2 :: nil)
@@ -540,7 +540,7 @@ End MATCH_TRACES_INV.
 
 Definition output_event (ev: event) : Prop :=
   match ev with
-  | Event_syscall _ _ _ => False
+  | Event_syscall _ _ _ _ => False
   | Event_vload _ _ _ _ => False
   | Event_vstore _ _ _ _ => True
   | Event_annot _ _ => True
