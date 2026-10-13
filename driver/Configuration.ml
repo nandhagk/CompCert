@@ -123,7 +123,7 @@ let get_bool_config key =
 
 let arch =
   match get_config_string "arch" with
-  | "powerpc"|"arm"|"x86"|"riscV"|"aarch64" as a -> a
+  | "powerpc"|"arm"|"x86"|"riscV"|"aarch64"|"wasm32" as a -> a
   | v -> bad_config "arch" [v]
 let model = get_config_string "model"
 let abi = get_config_string "abi"
@@ -158,4 +158,4 @@ let response_file_style =
 
 let gnu_toolchain = system <> "diab"
 
-let elf_target = system <> "macos" && system <> "cygwin"
+let elf_target = system <> "macos" && system <> "cygwin" && system <> "wasi"
