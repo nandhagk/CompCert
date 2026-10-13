@@ -26,17 +26,81 @@ open Transform
 let struct_return_style = ref SR_ref
 let struct_passing_style = ref SP_ref_callee
 
+(* Chasm's wasm32 profile uses LLVM 22's default (not multivalue) ABI.
+   Keep the reference interpreter and all other machine profiles unchanged. *)
+
+let wasm32_abi () =
+  (!config).name = "wasm32-wasi" && not !Clflags.option_interp
+
+let composite_members env ty =
+  match unroll env ty with
+  | TStruct(id, _) -> (Env.find_struct env id).Env.ci_members
+  | TUnion(id, _) -> (Env.find_union env id).Env.ci_members
+  | _ -> []
+
+(* An unnamed bitfield and arrays of empty records do not count as elements.
+   A flexible array member prevents both empty and singleton classification. *)
+
+let rec empty_field_type env ty =
+  match unroll env ty with
+  | TArray(_, Some 0L, _) -> true
+  | TArray(elt, Some _, _) -> empty_field_type env elt
+  | TStruct _ | TUnion _ -> empty_record env ty
+  | _ -> false
+
+and empty_field env fld =
+  (fld.fld_name = "" && fld.fld_bitfield <> None)
+  || empty_field_type env fld.fld_typ
+
+and empty_record env ty =
+  is_composite_type env ty
+  && not (contains_flex_array_mem env ty)
+  && List.for_all (empty_field env) (composite_members env ty)
+
+let rec singleton_type env ty =
+  let rec scalar_element ty =
+    match unroll env ty with
+    | TArray(elt, Some 1L, _) -> scalar_element elt
+    | TStruct _ | TUnion _ -> singleton_type env ty
+    | TInt _ | TFloat _ | TPtr _ | TEnum _ ->
+        Some (change_attributes_type env (fun _ -> []) ty)
+    | _ -> None in
+  if contains_flex_array_mem env ty then None else
+  match List.filter (fun fld -> not (empty_field env fld)) (composite_members env ty) with
+  | [fld] ->
+      begin match scalar_element fld.fld_typ with
+      | Some elt when sizeof env elt = sizeof env ty -> Some elt
+      | _ -> None
+      end
+  | _ -> None
+
+(* A narrow singleton has an ordinary i32 carrier, not a canonical narrow
+   signature. Stores to its member type re-extend it when the callee reads it. *)
+
+let singleton_carrier env ty =
+  match unroll env ty with
+  | TInt((IBool | IChar | ISChar | IUChar | IShort | IUShort), _) -> TInt(IInt, [])
+  | TEnum _ -> TInt(enum_ikind, [])
+  | _ -> ty
+
 (* Classification of function return types. *)
 
 type return_kind =
   | Ret_scalar    (**r a scalar type, returned as usual *)
   | Ret_ref       (**r a composite type, returned by reference *)
+  | Ret_empty     (**r an empty composite, no result carrier *)
+  | Ret_single of typ * typ (**r singleton (memory type, carrier type) *)
   | Ret_value of typ * int * int
                   (**r a small composite type, returned as an integer
                        (type, size, alignment) *)
 
 let classify_return env ty =
-  if is_composite_type env ty then begin
+  if is_composite_type env ty && wasm32_abi () then
+    if empty_record env ty then Ret_empty else
+    match singleton_type env ty with
+    | Some elt -> Ret_single(elt, singleton_carrier env elt)
+    | None -> Ret_ref
+  else if is_composite_type env ty then begin
     match sizeof env ty, alignof env ty with
     | Some sz, Some al ->
         begin match !struct_return_style with
@@ -61,11 +125,18 @@ let classify_return env ty =
 type param_kind =
   | Param_unchanged     (**r passed as is *)
   | Param_ref_caller    (**r passed by reference to a copy taken by the caller *)
+  | Param_empty        (**r evaluated, but no argument carrier *)
+  | Param_single of typ * typ (**r singleton (memory type, carrier type) *)
   | Param_flattened of int * int * int (**r passed as N integer arguments *)
                         (**r (N, size, alignment) *)
 
 let classify_param env ty =
-  if is_composite_type env ty then begin
+  if is_composite_type env ty && wasm32_abi () then
+    if empty_record env ty then Param_empty else
+    match singleton_type env ty with
+    | Some elt -> Param_single(elt, singleton_carrier env elt)
+    | None -> Param_ref_caller
+  else if is_composite_type env ty then begin
     match !struct_passing_style with
     | SP_ref_callee -> Param_unchanged
     | SP_ref_caller -> Param_ref_caller
@@ -215,6 +286,10 @@ let rec transf_type env t =
       begin match classify_return env tres with
       | Ret_scalar ->
           TFun(tres', None, vararg, attr)
+      | Ret_empty ->
+          TFun(TVoid [], None, vararg, attr)
+      | Ret_single(_, carrier) ->
+          TFun(transf_type env carrier, None, vararg, attr)
       | Ret_ref ->
           TFun(TVoid [], None, vararg, add_attributes attr attr_structret)
       | Ret_value(ty, sz, al) ->
@@ -226,6 +301,10 @@ let rec transf_type env t =
       begin match classify_return env tres with
       | Ret_scalar ->
           TFun(tres', Some args', vararg, attr)
+      | Ret_empty ->
+          TFun(TVoid [], Some args', vararg, attr)
+      | Ret_single(_, carrier) ->
+          TFun(transf_type env carrier, Some args', vararg, attr)
       | Ret_ref ->
           let res = Env.fresh_ident "_res" in
           TFun(TVoid [], Some((res, TPtr(tres', [])) :: args'), vararg,
@@ -249,6 +328,10 @@ and transf_funargs env = function
       match classify_param env t with
       | Param_unchanged ->
           (id, t') :: args'
+      | Param_empty ->
+          args'
+      | Param_single(_, carrier) ->
+          (id, transf_type env carrier) :: args'
       | Param_ref_caller ->
           (id, TPtr(t', [])) :: args'
       | Param_flattened(n, sz, al) ->
@@ -337,6 +420,25 @@ and transf_call env ctx opt_lhs fn args ty =
       match classify_return env ty with
       | Ret_scalar ->
           opt_eassign {edesc = ECall(fn', args'); etyp = ty'}
+      | Ret_empty ->
+          let ecall = {edesc = ECall(fn', args'); etyp = TVoid []} in
+          begin match ctx, opt_lhs with
+          | Effects, None -> ecall
+          | _, _ ->
+              let tmp = new_temp ~name:"_res" ty' in
+              ecomma ecall (opt_eassign tmp)
+          end
+      | Ret_single(elt, carrier) ->
+          let elt' = transf_type env elt in
+          let carrier' = transf_type env carrier in
+          let ecall = {edesc = ECall(fn', args'); etyp = carrier'} in
+          begin match ctx, opt_lhs with
+          | Effects, None -> ecall
+          | _, _ ->
+              let tmp = new_temp ~name:"_res" ty' in
+              opt_eassign
+                (ecomma (eassign (ereinterpret elt' tmp) (ecast elt' ecall)) tmp)
+          end
       | Ret_ref ->
           begin match ctx, opt_lhs with
           | Effects, None ->
@@ -386,6 +488,15 @@ and transf_arguments env args =
       | Param_unchanged ->
           let arg' = transf_expr env Val arg in
           (assignments, arg' :: args')
+      | Param_empty ->
+          (transf_expr env Effects arg :: assignments, args')
+      | Param_single(elt, carrier) ->
+          let ty' = transf_type env arg.etyp in
+          let elt' = transf_type env elt in
+          let carrier' = transf_type env carrier in
+          let tmp = new_temp ~name:"_arg" ty' in
+          (transf_assign env tmp arg :: assignments,
+           ecast carrier' (ereinterpret elt' tmp) :: args')
       | Param_ref_caller ->
           let ty' = transf_type env arg.etyp in
           let tmp = new_temp ~name:"_arg" ty' in
@@ -473,6 +584,17 @@ let rec transf_stmt s =
       begin match classify_return env e'.etyp, optres with
       | Ret_scalar, None ->
           {s with sdesc = Sreturn(Some e')}
+      | Ret_empty, None ->
+          sseq s.sloc
+            {s with sdesc = Sdo (transf_expr Effects e)}
+            {s with sdesc = Sreturn None}
+      | Ret_single(elt, carrier), None ->
+          let tmp = new_temp ~name:"_res" e'.etyp in
+          sseq s.sloc
+            (sassign s.sloc tmp e')
+            {s with sdesc = Sreturn
+              (Some (ecast (transf_type env carrier)
+                           (ereinterpret (transf_type env elt) tmp)))}
       | Ret_ref, Some dst ->
           sseq s.sloc
             (sassign s.sloc dst e')
@@ -522,6 +644,17 @@ let rec transf_funparams loc env params =
           ((x, tx') :: params',
            actions,
            subst)
+      | Param_empty ->
+          let tmp = new_temp ~name:x.C.name tx' in
+          (params', actions, IdentMap.add x tmp subst)
+      | Param_single(elt, carrier) ->
+          let elt' = transf_type env elt in
+          let carrier' = transf_type env carrier in
+          let tmp = new_temp ~name:x.C.name tx' in
+          let arg = {edesc = EVar x; etyp = carrier'} in
+          ((x, carrier') :: params',
+           sseq loc (sassign loc (ereinterpret elt' tmp) (ecast elt' arg)) actions,
+           IdentMap.add x tmp subst)
       | Param_ref_caller ->
           let tpx = TPtr(tx', []) in
           let ex = { edesc = EVar x; etyp = tpx } in
@@ -553,6 +686,16 @@ let transf_fundef env loc f =
     | Ret_scalar ->
         (f.fd_attrib,
          ret,
+         params,
+         transf_funbody env (subst_stmt subst f.fd_body) None)
+    | Ret_empty ->
+        (f.fd_attrib,
+         TVoid [],
+         params,
+         transf_funbody env (subst_stmt subst f.fd_body) None)
+    | Ret_single(_, carrier) ->
+        (f.fd_attrib,
+         transf_type env carrier,
          params,
          transf_funbody env (subst_stmt subst f.fd_body) None)
     | Ret_ref ->
