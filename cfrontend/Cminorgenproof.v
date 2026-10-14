@@ -889,7 +889,7 @@ Remark assign_variable_incr:
   assign_variable (cenv, stksz) (id, sz) = (cenv', stksz') -> stksz <= stksz'.
 Proof.
   simpl; intros. inv H.
-  generalize (align_le stksz 16 ltac:(lia)).
+  generalize (align_le stksz (min_safe_alignment sz) (min_safe_alignment_pos sz)).
   assert (0 <= Z.max 0 sz). apply Zmax_bound_l. lia.
   lia.
 Qed.
@@ -925,14 +925,6 @@ Proof.
   transitivity 1. reflexivity. unfold min_safe_alignment. rewrite zlt_true. auto. lia.
 Qed.
 
-Remark inj_offset_aligned_block16:
-  forall stacksize sz, Mem.inj_offset_aligned (align stacksize 16) sz.
-Proof.
-  intros; red. eapply Z.divide_trans. apply min_safe_alignment_8.
-  eapply Z.divide_trans. exists 2; reflexivity.
-  apply align_divides. lia.
-Qed.
-
 Lemma assign_variable_sound:
   forall cenv1 sz1 id sz cenv2 sz2 vars,
   assign_variable (cenv1, sz1) (id, sz) = (cenv2, sz2) ->
@@ -945,8 +937,8 @@ Lemma assign_variable_sound:
 Proof.
   unfold assign_variable; intros until vars; intros ASV NOREPET POS COMPAT SEP.
   inv ASV.
-  assert (LE: sz1 <= align sz1 16).
-  { apply align_le. lia. }
+  assert (LE: sz1 <= align sz1 (min_safe_alignment sz)).
+  { apply align_le. apply min_safe_alignment_pos. }
   assert (EITHER: forall id' sz',
              In (id', sz') (vars ++ (id, sz) :: nil) ->
              In (id', sz') vars /\ id' <> id \/ (id', sz') = (id, sz)).
@@ -960,9 +952,9 @@ Proof.
   exists ofs.
   split. rewrite PTree.gso; auto.
   split. auto. split. auto. zify; lia.
-  inv P. exists (align sz1 16).
+  inv P. exists (align sz1 (min_safe_alignment sz)).
   split. apply PTree.gss.
-  split. apply inj_offset_aligned_block16.
+  split. apply inj_offset_aligned_block.
   split. lia.
   lia.
   apply EITHER in H; apply EITHER in H0.

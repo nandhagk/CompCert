@@ -220,7 +220,7 @@ Definition assign_variable
     (cenv_stacksize: compilenv * Z) (id_sz: ident * Z) : compilenv * Z :=
   let (id, sz) := id_sz in
   let (cenv, stacksize) := cenv_stacksize in
-  let ofs := align stacksize 16 in
+  let ofs := align stacksize (min_safe_alignment sz) in
   (PTree.set id ofs cenv, ofs + Z.max 0 sz).
 
 Definition assign_variables (cenv_stacksize: compilenv * Z) (vars: list (ident * Z)) : compilenv * Z :=
