@@ -272,6 +272,9 @@ let enter_or_refine_function loc env id sto ty =
 let elab_expr_f : (Cabs.loc -> Env.t -> Cabs.expression -> C.exp * Env.t) ref
   = ref (fun _ _ _ -> assert false)
 
+let elab_attrib_expr_f : (Cabs.loc -> Env.t -> Cabs.expression -> C.exp) ref
+  = ref (fun _ _ _ -> assert false)
+
 let elab_funbody_f : (C.typ -> bool -> bool -> Env.t -> statement -> C.stmt) ref
   = ref (fun _ _ _ _ _ -> assert false)
 
@@ -495,7 +498,7 @@ let elab_simple_string loc enc chars =
 
 let elab_static_assert env exp loc_exp msg loc_msg loc =
   let (exp, env) = !elab_expr_f loc_exp env exp in
-  match Ceval.integer_expr env exp  with
+  begin match Ceval.integer_expr env exp  with
   | None ->
       error loc_exp "expression in static assertion is not an integer constant"
   | Some n ->
@@ -507,6 +510,8 @@ let elab_static_assert env exp loc_exp msg loc_msg loc =
               (* This can happen with a wide string literal *)
               error loc "static assertion failed (cannot display associated message)"
       end
+  end;
+  env
 
 
 (** * Elaboration of type expressions, type specifiers, name declarations *)
@@ -526,7 +531,7 @@ let elab_attr_arg loc env a =
         AIdent s
       end
   | _ ->
-      let b,env = !elab_expr_f loc env a in
+      let b = !elab_attrib_expr_f loc env a in
       match Ceval.constant_expr env b.etyp b with
       | Some(CInt(n, _, _)) -> AInt n
       | Some(CStr s) -> AString s
@@ -909,10 +914,10 @@ and elab_type_declarator ?(fundef = false) ?(param = false) loc env ty = functio
         else if d <> Cabs.JUSTBASE then
           error loc "'static' used in non-outermost array type derivation"
       end;
-      let sz' =
+      let sz', env =
         match sz with
         | None ->
-            None
+            None, env
         | Some sz ->
             let expr,env = (!elab_expr_f loc env sz) in
             match Ceval.integer_expr env expr  with
@@ -921,10 +926,10 @@ and elab_type_declarator ?(fundef = false) ?(param = false) loc env ty = functio
                 if n = 0L then warning loc Zero_length_array
                     "zero size arrays are an extension";
                 if not (Cutil.valid_array_size env ty n) then error loc "size of array is too large";
-                Some n
+                Some n, env
             | None ->
                 error loc "size of array is not a compile-time constant";
-                Some 1L in (* produces better error messages later *)
+                Some 1L, env in (* produces better error messages later *)
        elab_type_declarator ~fundef ~param loc env (TArray(ty, sz', a)) d
   | Cabs.PTR(cv_specs, d) ->
       let (ty, a) = get_nontype_attrs env ty in
@@ -983,7 +988,7 @@ and elab_parameter env (PARAM (spec, id, decl, attr, loc)) =
   let (sto, inl, noret, tydef, bty, env1) = elab_specifier loc env spec in
   if tydef then
     error loc "'typedef' used in function parameter";
-  let ((ty, _), _) = elab_type_declarator ~param:true loc env1 bty decl in
+  let ((ty, _), env1) = elab_type_declarator ~param:true loc env1 bty decl in
   let ty = add_attributes_type (elab_attributes env attr) ty in
   if sto <> Storage_default && sto <> Storage_register then
     error loc                               (* NB: 'auto' not allowed *)
@@ -1113,7 +1118,7 @@ and elab_field_group env = function
   (mmap2_filter elab_bitfield env' fieldlist names)
 
 | Field_group_static_assert(exp, loc_exp, msg, loc_msg, loc) ->
-    elab_static_assert env exp loc_exp msg loc_msg loc;
+    let env = elab_static_assert env exp loc_exp msg loc_msg loc in
     ([], env)
   
 (* Elaboration of a struct or union. C99 section 6.7.2.1 *)
@@ -1248,18 +1253,18 @@ and elab_struct_or_union only kind loc tag optmembers attrs env =
 (* Elaboration of an enum item.  C99 section 6.7.2.2 *)
 
 and elab_enum_item env ((s, exp), loc) nextval =
-  let (v, exp') =
+  let (v, exp', env) =
     match exp with
     | None ->
-        (nextval, None)
+        (nextval, None, env)
     | Some exp ->
         let exp',env = !elab_expr_f loc env exp in
         match Ceval.integer_expr env exp' with
-        | Some n -> (n, Some exp')
+        | Some n -> (n, Some exp', env)
         | None ->
             error loc
               "value of enumerator '%s' is not an integer constant" s;
-            (nextval, Some exp') in
+            (nextval, Some exp', env) in
   if redef Env.lookup_ident env s then
     error loc "'%s' redeclared as different kind of symbol" s;
   if redef Env.lookup_typedef env s then
@@ -1575,7 +1580,7 @@ end
 let rec elab_designator loc env zi desig =
   match desig with
   | [] ->
-      zi
+      zi, env
   | INFIELD_INIT name :: desig' ->
       begin match I.member env zi name with
       | I.OK zi' ->
@@ -1631,7 +1636,8 @@ let rec elab_list env zi il first =
             error loc "unsupported reinitialization of %s that was previously initialized as a whole" (I.name zi);
             raise Exit
       end else
-        elab_item env (elab_designator loc env (I.to_top zi) desig) item il'
+        let (desig, env) = elab_designator loc env (I.to_top zi) desig in
+        elab_item env desig item il'
 
 (* Perform the initialization described by [item] for the current
    subobject of state [zi].  Continue initializing with the list [il]. *)
@@ -2569,8 +2575,19 @@ let elab_expr ctx loc env a =
 
   in elab env a
 
+(* Expressions that appear as arguments to attributes are elaborated
+   in the [ctx_constexp] context, and must not define new structs or unions. *)
+
+let elab_attrib_expr loc env a =
+  let (b, env') = elab_expr ctx_constexp loc env a in
+  if not (Env.same_types env' env) then
+    fatal_error loc "cannot define new types within attributes";
+  b
+
 (* Filling in forward declaration *)
-let _ = elab_expr_f := (elab_expr ctx_constexp)
+let _ =
+  elab_expr_f := elab_expr ctx_constexp;
+  elab_attrib_expr_f := elab_attrib_expr
 
 let elab_opt_expr ctx loc env = function
   | None -> None,env
@@ -3028,7 +3045,7 @@ let elab_definition (for_loop: bool) (local: bool) (nonstatic_inline: bool)
 
   (* static assertion *)
   | STATIC_ASSERT(exp, loc_exp, msg, loc_msg, loc) ->
-      elab_static_assert env exp loc_exp msg loc_msg loc;
+      let env = elab_static_assert env exp loc_exp msg loc_msg loc in
       ([], env)
 
 (* Extended asm *)
