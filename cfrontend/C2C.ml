@@ -359,6 +359,8 @@ let make_builtin_memcpy args =
 type vararg_bridge = {
   va_start_marker: AST.external_function;
   va_arg_marker: AST.external_function;
+  va_copy_size: Z.t;
+  va_copy_alignment: Z.t;
   fresh_local: unit -> AST.ident;
 }
 
@@ -1034,7 +1036,11 @@ let rec convertExpr env e =
   | C.ECall({edesc = C.EVar {name = "__builtin_va_copy"}}, [arg1; arg2]) ->
       let dst = convertExpr env arg1 in
       let src = convertExpr env arg2 in
-      Ebuiltin(AST.EF_memcpy(Z.of_uint CBuiltins.size_va_list, Z.of_uint 4),
+      let size, alignment =
+        match !vararg_bridge with
+        | Some bridge -> bridge.va_copy_size, bridge.va_copy_alignment
+        | None -> Z.of_uint CBuiltins.size_va_list, Z.of_uint 4 in
+      Ebuiltin(AST.EF_memcpy(size, alignment),
                [Tpointer(Tvoid, noattr); Tpointer(Tvoid, noattr)],
                Econs(va_list_ptr dst, Econs(va_list_ptr src, Enil)),
                Tvoid)
