@@ -327,6 +327,18 @@ Inductive wt_arguments: exprlist -> list type -> Prop :=
 Definition subtype (t1 t2: type) : Prop :=
   forall v, wt_val v t1 -> wt_val v t2.
 
+(** The builtin invocations emitted by C2C have one of three exact decorations:
+    a void result, a typed eager selection, or the declared integer annotation result. *)
+Definition wt_builtin (ef: external_function) (tyargs: list type) (ty: type) : Prop :=
+     (ty = Tvoid /\ sig_res (ef_sig ef) = Xvoid)
+  \/ (tyargs = type_bool :: ty :: ty :: nil
+      /\ let t := typ_of_type ty in
+         let x := inj_type t in
+         let sg := [Xint; x; x ---> x]%asttyp in
+         ef = EF_builtin "__builtin_sel"%string sg)
+  \/ (ty = type_int32s /\ tyargs = type_int32s :: nil
+      /\ exists kind text, ef = EF_annot_val kind text AST.Tint).
+
 Section WT_EXPR_STMT.
 
 Variable ce: composite_env.
@@ -395,14 +407,7 @@ Inductive wt_rvalue : expr -> Prop :=
   | wt_Ebuiltin: forall ef tyargs rargs ty,
       wt_exprlist rargs ->
       wt_arguments rargs tyargs ->
-      (* This typing rule is specialized to the builtin invocations generated
-         by C2C, which are either __builtin_sel or builtins returning void. *)
-         (ty = Tvoid /\ sig_res (ef_sig ef) = Xvoid)
-      \/ (tyargs = type_bool :: ty :: ty :: nil
-          /\ let t := typ_of_type ty in
-             let x := inj_type t in
-             let sg := [Xint; x; x ---> x]%asttyp in
-             ef = EF_builtin "__builtin_sel"%string sg) ->
+      wt_builtin ef tyargs ty ->
       wt_rvalue (Ebuiltin ef tyargs rargs ty)
   | wt_Eparen: forall r tycast ty,
       wt_rvalue r ->
@@ -752,11 +757,24 @@ Definition ecall (fn: expr) (args: exprlist) : res expr :=
       Error (msg "call: not a function")
   end.
 
+(** Recognize only the native builtin decorations admitted by [wt_builtin]. *)
+Definition check_builtin_type (ef: external_function) (tyargs: list type) (tyres: type) : bool :=
+  let x := inj_type (typ_of_type tyres) in
+  (type_eq tyres Tvoid && xtype_eq (sig_res (ef_sig ef)) Xvoid)
+  || ((typelist_eq tyargs (type_bool :: tyres :: tyres :: nil)
+       && external_function_eq ef (EF_builtin "__builtin_sel"%string
+            [Xint; x; x ---> x]%asttyp))
+      || match ef with
+         | EF_annot_val _ _ targ =>
+             typ_eq targ AST.Tint && type_eq tyres type_int32s
+             && typelist_eq tyargs (type_int32s :: nil)
+         | _ => false
+         end).
+
 Definition ebuiltin (ef: external_function) (tyargs: list type) (args: exprlist) (tyres: type) : res expr :=
   do x1 <- check_rvals args;
   do x2 <- check_arguments args tyargs;
-  if type_eq tyres Tvoid
-  && xtype_eq (sig_res (ef_sig ef)) Xvoid
+  if check_builtin_type ef tyargs tyres
   then OK (Ebuiltin ef tyargs args tyres)
   else Error (msg "builtin: wrong type decoration").
 
@@ -1248,14 +1266,32 @@ Proof.
   econstructor; eauto with ty. eapply check_arguments_sound; eauto.
 Qed.
 
+(** Executable acceptance supplies the specialized declarative builtin decoration. *)
+Lemma check_builtin_type_sound:
+  forall ef tyargs tyres,
+  check_builtin_type ef tyargs tyres = true -> wt_builtin ef tyargs tyres.
+Proof.
+  intros ef tyargs tyres Hcheck.
+  unfold check_builtin_type in Hcheck. unfold wt_builtin.
+  apply orb_prop in Hcheck. destruct Hcheck as [Hvoid | Hremaining].
+- InvBooleans. left; split; assumption.
+- apply orb_prop in Hremaining. destruct Hremaining as [Hselect | Hannotation].
+  + InvBooleans. right; left; split; assumption.
+  + destruct ef; simpl in Hannotation; try discriminate.
+    InvBooleans. subst. right; right; split; [reflexivity |].
+    split; [reflexivity |]. eexists; eexists; reflexivity.
+Qed.
+
 Lemma ebuiltin_sound:
   forall ef tyargs args tyres a,
   ebuiltin ef tyargs args tyres = OK a -> wt_exprlist ce e args -> wt_expr ce e a.
 Proof.
   intros. monadInv H.
-  destruct (type_eq tyres Tvoid); simpl in EQ2; try discriminate.
-  destruct (xtype_eq (sig_res (ef_sig ef)) Xvoid); inv EQ2.
-  econstructor; eauto. eapply check_arguments_sound; eauto.
+  destruct (check_builtin_type ef tyargs tyres) eqn:DEC; inv EQ2.
+  eapply wt_Ebuiltin.
+  exact H0.
+  eapply check_arguments_sound; eauto.
+  apply check_builtin_type_sound; exact DEC.
 Qed.
 
 Lemma eselection_sound:
@@ -1266,7 +1302,7 @@ Proof.
   eapply wt_Ebuiltin.
   repeat (constructor; eauto with ty).
   repeat (constructor; eauto with ty). apply wt_bool_cast; eauto with ty.
-  right; auto.
+  right; left; auto.
 Qed.
 
 Lemma sdo_sound:
@@ -1827,7 +1863,8 @@ Proof.
   constructor; auto.
 - (* comma *) auto.
 - (* paren *) inv H3. constructor. apply H5. eapply pres_sem_cast; eauto.
-- (* builtin *) subst. destruct H7 as [(A & B) | (A & B)].
+- (* builtin *) subst. unfold wt_builtin in H7.
+  destruct H7 as [(A & B) | [(A & B) | (A & B & kind & text & C)]].
 + subst ty. auto with ty.
 + simpl in B. set (T := typ_of_type ty) in *. set (X := inj_type T) in *.
   set (sg := [Xint; X; X ---> X]%asttyp) in *.
@@ -1848,6 +1885,8 @@ Proof.
   assert (EQ: Val.normalize v' T = v').
   { apply Val.normalize_idem. apply val_casted_has_type; auto. }
   rewrite EQ. apply wt_val_casted; auto.
++ subst ty tyargs ef. red in H0. inv H0. inv H.
+  constructor. eapply wt_val_casted. eapply cast_val_is_casted; eauto.
 Qed.
 
 Lemma wt_lred:
