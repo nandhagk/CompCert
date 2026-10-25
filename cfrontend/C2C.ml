@@ -354,6 +354,32 @@ let make_builtin_memcpy args =
 
 (** ** Translation of [va_arg] for variadic functions. *)
 
+(* An optional frontend bridge preserves typed requests for an early source lowering.
+   Its identities and signatures belong to the embedding compiler, not this adapter. *)
+type vararg_bridge = {
+  va_start_marker: AST.external_function;
+  va_arg_marker: AST.external_function;
+  va_copy_size: Z.t;
+  va_copy_alignment: Z.t;
+  fresh_local: unit -> AST.ident;
+}
+
+let vararg_bridge : vararg_bridge option ref = ref None
+
+(* Only a function conversion may allocate scratch locals.  The scope is restored on
+   exceptions as well as success, so failed units cannot leak declarations. *)
+let vararg_scratch : (AST.ident * Ctypes.coq_type) list option ref = ref None
+
+let with_vararg_scratch f =
+  let previous = !vararg_scratch in
+  vararg_scratch := Some [];
+  Fun.protect
+    ~finally:(fun () -> vararg_scratch := previous)
+    (fun () ->
+      let result = f () in
+      let locals = match !vararg_scratch with Some locals -> List.rev locals | None -> [] in
+      result, locals)
+
 let va_list_ptr e =
   if not CBuiltins.va_list_scalar then e else
     match e with
@@ -382,6 +408,25 @@ let make_builtin_va_arg_by_ref helper ty arg =
   Evalof(Ederef(Ecast(call, ty_ptr), ty), ty)
 
 let make_builtin_va_arg env ty e =
+  match !vararg_bridge with
+  | Some bridge ->
+      begin match !vararg_scratch with
+      | None -> fatal_error "va_arg request outside a function"
+      | Some locals ->
+          let id = bridge.fresh_local () in
+          vararg_scratch := Some ((id, ty) :: locals);
+          let scratch = Evar(id, ty) in
+          let cursor = va_list_ptr e in
+          let output_ty = Tpointer(ty, noattr) in
+          let request =
+            Ebuiltin(bridge.va_arg_marker,
+                     [typeof cursor; output_ty],
+                     Econs(cursor, Econs(Eaddrof(scratch, output_ty), Enil)), Tvoid) in
+          Ecomma(request, Evalof(scratch, ty), ty)
+      end
+  | None ->
+  if not !Clflags.option_fvararg_calls then
+    unsupported "va_arg request (consider adding option [-fvararg-calls])";
   match ty with
   | Ctypes.Tint _ ->
       make_builtin_va_arg_by_val
@@ -944,8 +989,7 @@ let rec convertExpr env e =
   | C.ECall({edesc = C.EVar {name = "__builtin_annot_intval"}}, args) ->
       begin match args with
       | [ {edesc = C.EConst(CStr txt)}; arg ] ->
-          let targ = convertTyp env
-                         (Cutil.default_argument_conversion env arg.etyp) in
+          let targ = type_int32s in
           Ebuiltin(AST.EF_annot_val(P.of_int 1, txt, typ_of_type targ),
                    [targ], convertExprList env [arg],
                    convertTyp env e.etyp)
@@ -977,9 +1021,13 @@ let rec convertExpr env e =
       ewrap (Ctyping.eunop Cop.Oabsfloat (convertExpr env arg))
 
   | C.ECall({edesc = C.EVar {name = "__builtin_va_start"}} as fn, [arg]) ->
-      Ecall(convertExpr env fn,
-            Econs(va_list_ptr(convertExpr env arg), Enil),
-            convertTyp env e.etyp)
+      let cursor = va_list_ptr(convertExpr env arg) in
+      begin match !vararg_bridge with
+      | Some bridge ->
+          Ebuiltin(bridge.va_start_marker, [typeof cursor], Econs(cursor, Enil), Tvoid)
+      | None ->
+          Ecall(convertExpr env fn, Econs(cursor, Enil), convertTyp env e.etyp)
+      end
 
   | C.ECall({edesc = C.EVar {name = "__builtin_va_arg"}}, [arg1; arg2]) ->
       make_builtin_va_arg env (convertTyp env e.etyp) (convertExpr env arg1)
@@ -990,7 +1038,11 @@ let rec convertExpr env e =
   | C.ECall({edesc = C.EVar {name = "__builtin_va_copy"}}, [arg1; arg2]) ->
       let dst = convertExpr env arg1 in
       let src = convertExpr env arg2 in
-      Ebuiltin(AST.EF_memcpy(Z.of_uint CBuiltins.size_va_list, Z.of_uint 4),
+      let size, alignment =
+        match !vararg_bridge with
+        | Some bridge -> bridge.va_copy_size, bridge.va_copy_alignment
+        | None -> Z.of_uint CBuiltins.size_va_list, Z.of_uint 4 in
+      Ebuiltin(AST.EF_memcpy(size, alignment),
                [Tpointer(Tvoid, noattr); Tpointer(Tvoid, noattr)],
                Econs(va_list_ptr dst, Econs(va_list_ptr src, Enil)),
                Tvoid)
@@ -1191,7 +1243,7 @@ let convertFundef loc env fd =
         Debug.atom_local_variable id id';
         (id', convertTyp env ty))
       fd.fd_locals in
-  let body' = convertStmt env fd.fd_body in
+  let body', scratch = with_vararg_scratch (fun () -> convertStmt env fd.fd_body) in
   let id' = intern_string fd.fd_name.name in
   let noinline =  Cutil.find_custom_attributes ["noinline";"__noinline__"] fd.fd_attrib <> [] in
   let inline = if noinline || fd.fd_vararg then (* PR#15 *)
@@ -1216,7 +1268,7 @@ let convertFundef loc env fd =
            fn_callconv = convertCallconv fd.fd_ret (Some fd.fd_params)
                                          fd.fd_vararg fd.fd_attrib;
            fn_params = params;
-           fn_vars = vars;
+           fn_vars = vars @ scratch;
            fn_body = body'}))
 
 (** External function declaration *)

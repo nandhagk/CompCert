@@ -32,6 +32,14 @@ let struct_passing_style = ref SP_ref_callee
 let wasm32_abi () =
   (!config).name = "wasm32-wasi" && not !Clflags.option_interp
 
+(* The early variadic lowering needs the original category of every extra
+   operand.  Count named source parameters before empty/singleton/sret changes. *)
+let rec variadic_fixed_count env ty =
+  match unroll env ty with
+  | TFun(_, Some parameters, true, _) when wasm32_abi () -> Some (List.length parameters)
+  | TPtr(ty, _) -> variadic_fixed_count env ty
+  | _ -> None
+
 let composite_members env ty =
   match unroll env ty with
   | TStruct(id, _) -> (Env.find_struct env id).Env.ci_members
@@ -413,9 +421,9 @@ and transf_call env ctx opt_lhs fn args ty =
     (* Do not transform the call in this case, just use the default
        pass-by-reference mode for struct/union arguments. *)
     let args' = List.map (fun arg -> transf_expr env Val arg) args in
-    opt_eassign {edesc = ECall(fn, args'); etyp = ty}
+    opt_eassign {edesc = ECall(fn, args'); etyp = ty'}
   | _ ->
-    let (assignments, args') = transf_arguments env args in
+    let (assignments, args') = transf_arguments env (variadic_fixed_count env fn.etyp) args in
     let call =
       match classify_return env ty with
       | Ret_scalar ->
@@ -479,11 +487,13 @@ and transf_call env ctx opt_lhs fn args ty =
         arg      --->   addr = &(arg) ... loadwords addr ...
 *)
 
-and transf_arguments env args =
-  match args with
-  | [] -> ([], [])
-  | arg :: args ->
-      let (assignments, args') = transf_arguments env args in
+and transf_arguments env fixed args =
+  match fixed, args with
+  | _, [] -> ([], [])
+  | Some 0, _ -> ([], List.map (transf_expr env Val) args)
+  | _, arg :: args ->
+      let next = match fixed with None -> None | Some n -> Some (n - 1) in
+      let (assignments, args') = transf_arguments env next args in
       match classify_param env arg.etyp with
       | Param_unchanged ->
           let arg' = transf_expr env Val arg in
