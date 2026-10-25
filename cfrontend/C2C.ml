@@ -425,6 +425,8 @@ let make_builtin_va_arg env ty e =
           Ecomma(request, Evalof(scratch, ty), ty)
       end
   | None ->
+  if not !Clflags.option_fvararg_calls then
+    unsupported "va_arg request (consider adding option [-fvararg-calls])";
   match ty with
   | Ctypes.Tint _ ->
       make_builtin_va_arg_by_val
