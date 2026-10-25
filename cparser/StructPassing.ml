@@ -421,7 +421,7 @@ and transf_call env ctx opt_lhs fn args ty =
     (* Do not transform the call in this case, just use the default
        pass-by-reference mode for struct/union arguments. *)
     let args' = List.map (fun arg -> transf_expr env Val arg) args in
-    opt_eassign {edesc = ECall(fn, args'); etyp = ty}
+    opt_eassign {edesc = ECall(fn, args'); etyp = ty'}
   | _ ->
     let (assignments, args') = transf_arguments env (variadic_fixed_count env fn.etyp) args in
     let call =
