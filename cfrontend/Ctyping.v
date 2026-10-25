@@ -1284,7 +1284,7 @@ Proof.
 - InvBooleans. left; split; assumption.
 - apply orb_prop in Hremaining. destruct Hremaining as [Hselect | Hannotation].
   + apply andb_prop in Hselect. destruct Hselect as [Harguments Hdescriptor].
-    apply orb_prop in Harguments. destruct Harguments as [Hbool | Hint].
+    apply orb_prop in Harguments. destruct Harguments as [Hbool | Hinteger].
     * InvBooleans. right; left; exists type_bool.
       split; [left; reflexivity |]. split; assumption.
     * InvBooleans. right; left; exists type_int32s.
