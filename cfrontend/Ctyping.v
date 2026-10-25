@@ -1314,8 +1314,8 @@ Proof.
   apply type_conditional_cast in EQ3. destruct EQ3 as [Hcast2 Hcast3].
   eapply wt_Ebuiltin.
   constructor.
-  apply wt_Ecast. exact Hr1. apply wt_bool_cast; eauto with ty.
-  constructor. exact Hr2. constructor. exact Hr3. constructor.
+  apply wt_Ecast. eauto with ty. apply wt_bool_cast; eauto with ty.
+  constructor. eauto with ty. constructor. eauto with ty. constructor.
   constructor. apply wt_cast_int.
   constructor. exact Hcast2. constructor. exact Hcast3. constructor.
   right; left; exists type_int32s.
