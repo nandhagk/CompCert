@@ -781,15 +781,25 @@ Definition ebuiltin (ef: external_function) (tyargs: list type) (args: exprlist)
   then OK (Ebuiltin ef tyargs args tyres)
   else Error (msg "builtin: wrong type decoration").
 
+Definition selection_builtin (r1 r2 r3: expr) (ty: type) : expr :=
+  let t := inj_type (typ_of_type ty) in
+  let sg := [Xint; t; t ---> t]%asttyp in
+  Ebuiltin (EF_builtin "__builtin_sel"%string sg)
+        (type_int32s :: ty :: ty :: nil)
+        (Econs (Ecast r1 type_bool) (Econs r2 (Econs r3 Enil))) ty.
+
+Definition selection_expression (r1 r2 r3: expr) (ty: type) : expr :=
+  match ty with
+  | Tpointer _ _ =>
+      Ecast (selection_builtin r1 (Ecast r2 ty) (Ecast r3 ty) size_t) ty
+  | _ => selection_builtin r1 r2 r3 ty
+  end.
+
 Definition eselection (r1 r2 r3: expr) : res expr :=
   do x1 <- check_rval r1; do x2 <- check_rval r2; do x3 <- check_rval r3;
   do y1 <- check_bool (typeof r1);
   do ty <- type_conditional (typeof r2) (typeof r3);
-  let t := inj_type (typ_of_type ty) in
-  let sg := [Xint; t; t ---> t]%asttyp in
-  OK (Ebuiltin (EF_builtin "__builtin_sel"%string sg)
-        (type_int32s :: ty :: ty :: nil)
-        (Econs (Ecast r1 type_bool) (Econs r2 (Econs r3 Enil))) ty).
+  OK (selection_expression r1 r2 r3 ty).
 
 Definition sdo (a: expr) : res statement :=
   do x <- check_rval a; OK (Sdo a).
@@ -1047,6 +1057,51 @@ Proof.
 - destruct i2; congruence.
 - subst i2; congruence.
 - destruct i2; congruence.
+Qed.
+
+Lemma wt_cast_pointer_size_t:
+  forall ty attr, wt_cast (Tpointer ty attr) size_t.
+Proof.
+  intros; unfold wt_cast, size_t, classify_cast; destruct Archi.ptr64; congruence.
+Qed.
+
+Lemma wt_cast_size_t_pointer:
+  forall ty attr, wt_cast size_t (Tpointer ty attr).
+Proof.
+  intros; unfold wt_cast, size_t, classify_cast; destruct Archi.ptr64; congruence.
+Qed.
+
+(** The integer carrier uses CompCert's pointer-preserving casts in both directions. *)
+Lemma selection_pointer_carrier_casts:
+  forall value ty attr m,
+  sem_cast value (Tpointer ty attr) size_t m =
+    sem_cast value (Tpointer ty attr) (Tpointer ty attr) m /\
+  sem_cast value size_t (Tpointer ty attr) m =
+    sem_cast value (Tpointer ty attr) (Tpointer ty attr) m.
+Proof.
+  intros; unfold sem_cast, size_t, classify_cast; destruct Archi.ptr64; split; reflexivity.
+Qed.
+
+(** Pointer values and their width-correct integer nulls survive the carrier unchanged. *)
+Lemma selection_pointer_carrier_identity:
+  forall value ty attr m, val_casted value (Tpointer ty attr) ->
+  sem_cast value (Tpointer ty attr) size_t m = Some value /\
+  sem_cast value size_t (Tpointer ty attr) m = Some value.
+Proof.
+  intros value ty attr m Hcasted.
+  destruct (selection_pointer_carrier_casts value ty attr m) as [Hto Hfrom].
+  rewrite Hto, Hfrom; split; apply cast_val_casted; exact Hcasted.
+Qed.
+
+(** The eager builtin's carrier normalization retains pointer identity and provenance. *)
+Lemma selection_pointer_carrier_normalizes:
+  forall value ty attr, val_casted value (Tpointer ty attr) ->
+  Val.normalize value (typ_of_type size_t) = value.
+Proof.
+  intros value ty attr Hcasted.
+  assert (Hcarrier: typ_of_type size_t = typ_of_type (Tpointer ty attr)).
+  { unfold size_t; simpl; unfold Tptr; destruct Archi.ptr64; reflexivity. }
+  rewrite Hcarrier; apply Val.normalize_idem; apply val_casted_has_type; exact Hcasted.
 Qed.
  
 Lemma type_combine_cast:
@@ -1306,20 +1361,36 @@ Proof.
   apply check_builtin_type_sound; exact DEC.
 Qed.
 
+Lemma selection_builtin_sound:
+  forall r1 r2 r3 ty,
+  wt_rvalue ce e r1 -> wt_rvalue ce e r2 -> wt_rvalue ce e r3 ->
+  wt_bool (typeof r1) -> wt_cast (typeof r2) ty -> wt_cast (typeof r3) ty ->
+  wt_rvalue ce e (selection_builtin r1 r2 r3 ty).
+Proof.
+  intros r1 r2 r3 ty Hr1 Hr2 Hr3 Hbool Hcast2 Hcast3.
+  unfold selection_builtin.
+  eapply wt_Ebuiltin.
+  constructor.
+  apply wt_Ecast. exact Hr1. apply wt_bool_cast; exact Hbool.
+  constructor. exact Hr2. constructor. exact Hr3. constructor.
+  constructor. apply wt_cast_int.
+  constructor. exact Hcast2. constructor. exact Hcast3. constructor.
+  right; left; exists type_int32s.
+  split; [right; reflexivity |]. split; reflexivity.
+Qed.
+
 Lemma eselection_sound:
   forall r1 r2 r3 a, eselection r1 r2 r3 = OK a ->
   wt_expr ce e r1 -> wt_expr ce e r2 -> wt_expr ce e r3 -> wt_expr ce e a.
 Proof.
   intros r1 r2 r3 a Hselection Hr1 Hr2 Hr3. monadInv Hselection.
   apply type_conditional_cast in EQ3. destruct EQ3 as [Hcast2 Hcast3].
-  eapply wt_Ebuiltin.
-  constructor.
-  apply wt_Ecast. eauto with ty. apply wt_bool_cast; eauto with ty.
-  constructor. eauto with ty. constructor. eauto with ty. constructor.
-  constructor. apply wt_cast_int.
-  constructor. exact Hcast2. constructor. exact Hcast3. constructor.
-  right; left; exists type_int32s.
-  split; [right; reflexivity |]. split; reflexivity.
+  destruct x3; cbn [selection_expression];
+    try solve [apply selection_builtin_sound; eauto with ty].
+  apply wt_Ecast.
+  apply selection_builtin_sound; try (apply wt_Ecast; eauto with ty);
+    eauto using wt_cast_pointer_size_t with ty.
+  apply wt_cast_size_t_pointer.
 Qed.
 
 Lemma sdo_sound:
