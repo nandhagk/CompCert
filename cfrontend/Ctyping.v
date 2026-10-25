@@ -1101,7 +1101,8 @@ Proof.
   intros value ty attr Hcasted.
   assert (Hcarrier: typ_of_type size_t = typ_of_type (Tpointer ty attr)).
   { unfold size_t; simpl; unfold Tptr; destruct Archi.ptr64; reflexivity. }
-  rewrite Hcarrier; apply Val.normalize_idem; apply val_casted_has_type; exact Hcasted.
+  rewrite Hcarrier; apply Val.normalize_idem; apply val_casted_has_type.
+  exact Hcasted. discriminate.
 Qed.
  
 Lemma type_combine_cast:
