@@ -944,8 +944,7 @@ let rec convertExpr env e =
   | C.ECall({edesc = C.EVar {name = "__builtin_annot_intval"}}, args) ->
       begin match args with
       | [ {edesc = C.EConst(CStr txt)}; arg ] ->
-          let targ = convertTyp env
-                         (Cutil.default_argument_conversion env arg.etyp) in
+          let targ = type_int32s in
           Ebuiltin(AST.EF_annot_val(P.of_int 1, txt, typ_of_type targ),
                    [targ], convertExprList env [arg],
                    convertTyp env e.etyp)
