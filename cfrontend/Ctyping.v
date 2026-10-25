@@ -331,7 +331,9 @@ Definition subtype (t1 t2: type) : Prop :=
     a void result, a typed eager selection, or the declared integer annotation result. *)
 Definition wt_builtin (ef: external_function) (tyargs: list type) (ty: type) : Prop :=
      (ty = Tvoid /\ sig_res (ef_sig ef) = Xvoid)
-  \/ (tyargs = type_bool :: ty :: ty :: nil
+  \/ (exists condition_type,
+      (condition_type = type_bool \/ condition_type = type_int32s)
+      /\ tyargs = condition_type :: ty :: ty :: nil
       /\ let t := typ_of_type ty in
          let x := inj_type t in
          let sg := [Xint; x; x ---> x]%asttyp in
@@ -761,7 +763,8 @@ Definition ecall (fn: expr) (args: exprlist) : res expr :=
 Definition check_builtin_type (ef: external_function) (tyargs: list type) (tyres: type) : bool :=
   let x := inj_type (typ_of_type tyres) in
   (type_eq tyres Tvoid && xtype_eq (sig_res (ef_sig ef)) Xvoid)
-  || ((typelist_eq tyargs (type_bool :: tyres :: tyres :: nil)
+  || (((typelist_eq tyargs (type_bool :: tyres :: tyres :: nil)
+        || typelist_eq tyargs (type_int32s :: tyres :: tyres :: nil))
        && external_function_eq ef (EF_builtin "__builtin_sel"%string
             [Xint; x; x ---> x]%asttyp))
       || match ef with
@@ -782,7 +785,11 @@ Definition eselection (r1 r2 r3: expr) : res expr :=
   do x1 <- check_rval r1; do x2 <- check_rval r2; do x3 <- check_rval r3;
   do y1 <- check_bool (typeof r1);
   do ty <- type_conditional (typeof r2) (typeof r3);
-  OK (Eselection r1 r2 r3 ty).
+  let t := inj_type (typ_of_type ty) in
+  let sg := [Xint; t; t ---> t]%asttyp in
+  OK (Ebuiltin (EF_builtin "__builtin_sel"%string sg)
+        (type_int32s :: ty :: ty :: nil)
+        (Econs (Ecast r1 type_bool) (Econs r2 (Econs r3 Enil))) ty).
 
 Definition sdo (a: expr) : res statement :=
   do x <- check_rval a; OK (Sdo a).
@@ -1276,7 +1283,12 @@ Proof.
   apply orb_prop in Hcheck. destruct Hcheck as [Hvoid | Hremaining].
 - InvBooleans. left; split; assumption.
 - apply orb_prop in Hremaining. destruct Hremaining as [Hselect | Hannotation].
-  + InvBooleans. right; left; split; assumption.
+  + apply andb_prop in Hselect. destruct Hselect as [Harguments Hdescriptor].
+    apply orb_prop in Harguments. destruct Harguments as [Hbool | Hint].
+    * InvBooleans. right; left; exists type_bool.
+      split; [left; reflexivity |]. split; assumption.
+    * InvBooleans. right; left; exists type_int32s.
+      split; [right; reflexivity |]. split; assumption.
   + destruct ef; simpl in Hannotation; try discriminate.
     InvBooleans. subst. right; right; split; [reflexivity |].
     split; [reflexivity |]. eexists; eexists; reflexivity.
@@ -1298,11 +1310,16 @@ Lemma eselection_sound:
   forall r1 r2 r3 a, eselection r1 r2 r3 = OK a ->
   wt_expr ce e r1 -> wt_expr ce e r2 -> wt_expr ce e r3 -> wt_expr ce e a.
 Proof.
-  intros. monadInv H. apply type_conditional_cast in EQ3. destruct EQ3.
+  intros r1 r2 r3 a Hselection Hr1 Hr2 Hr3. monadInv Hselection.
+  apply type_conditional_cast in EQ3. destruct EQ3 as [Hcast2 Hcast3].
   eapply wt_Ebuiltin.
-  repeat (constructor; eauto with ty).
-  repeat (constructor; eauto with ty). apply wt_bool_cast; eauto with ty.
-  right; left; auto.
+  constructor.
+  apply wt_Ecast. exact Hr1. apply wt_bool_cast; eauto with ty.
+  constructor. exact Hr2. constructor. exact Hr3. constructor.
+  constructor. apply wt_cast_int.
+  constructor. exact Hcast2. constructor. exact Hcast3. constructor.
+  right; left; exists type_int32s.
+  split; [right; reflexivity |]. split; reflexivity.
 Qed.
 
 Lemma sdo_sound:
@@ -1864,17 +1881,17 @@ Proof.
 - (* comma *) auto.
 - (* paren *) inv H3. constructor. apply H5. eapply pres_sem_cast; eauto.
 - (* builtin *) subst. unfold wt_builtin in H7.
-  destruct H7 as [(A & B) | [(A & B) | (A & B & kind & text & C)]].
+  destruct H7 as [(A & B) | [(condition_type & A & B & C) |
+                            (A & B & kind & text & C)]].
 + subst ty. auto with ty.
-+ simpl in B. set (T := typ_of_type ty) in *. set (X := inj_type T) in *.
++ subst tyargs. simpl in C. set (T := typ_of_type ty) in *. set (X := inj_type T) in *.
   set (sg := [Xint; X; X ---> X]%asttyp) in *.
   assert (LK: lookup_builtin_function "__builtin_sel"%string sg = Some (BI_standard (BI_select T))).
   { unfold sg, X, T; destruct ty as   [ | ? ? ? | ? | [] ? | ? ? | ? ? ? | ? ? ? | ? ? | ? ? ];
     simpl; unfold Tptr; destruct Archi.ptr64; reflexivity. }
   subst ef. red in H0. red in H0. rewrite LK in H0. inv H0. 
   inv H. inv H8. inv H9. inv H10. simpl in H1.
-  assert (A: val_casted v1 type_bool) by (eapply cast_val_is_casted; eauto).
-  inv A. 
+  destruct v1; simpl in H1; try discriminate.
   set (v' := if Int.eq n Int.zero then v4 else v2) in *.
   constructor.
   destruct (type_eq ty Tvoid).
