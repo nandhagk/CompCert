@@ -1891,7 +1891,7 @@ Proof.
     simpl; unfold Tptr; destruct Archi.ptr64; reflexivity. }
   subst ef. red in H0. red in H0. rewrite LK in H0. inv H0. 
   inv H. inv H8. inv H9. inv H10. simpl in H1.
-  destruct v1; simpl in H1; try discriminate.
+  destruct v1 as [|n|wide|number|single|block offset]; simpl in H1; try discriminate.
   set (v' := if Int.eq n Int.zero then v4 else v2) in *.
   constructor.
   destruct (type_eq ty Tvoid).
