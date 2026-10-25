@@ -383,7 +383,16 @@ let with_vararg_scratch f =
 let va_list_ptr e =
   if not CBuiltins.va_list_scalar then e else
     match e with
-    | Evalof(e', _) -> Eaddrof(e', Tpointer(typeof e, noattr))
+    | Evalof(e', _) ->
+        let ty = typeof e in
+        let address = Eaddrof(e', Tpointer(ty, noattr)) in
+        begin match !vararg_bridge, ty with
+        | Some _, Tpointer(Tvoid, { attr_volatile = false; attr_alignas = Some _ }) ->
+            (* Marker operands describe cursor values, not their storage alignment.
+               Keep the aligned object in the child and leave volatile cursors alone. *)
+            Ecast(address, Tpointer(typeconv ty, noattr))
+        | _ -> address
+        end
     | _             -> error "bad use of a va_list object"; e
 
 let make_builtin_va_arg_by_val helper ty ty_ret arg =
